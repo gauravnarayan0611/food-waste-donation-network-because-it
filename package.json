@@ -2,34 +2,26 @@
   "name": "food-waste-donation-network-because-it",
   "version": "1.0.0",
   "description": "FoodBridge connects food donors with verified NGOs and delivery partners through a React app and Express API.",
-  "main": "server/index.js",
+  "private": true,
+  "main": "backend/index.js",
+  "workspaces": [
+    "Admin",
+    "frontend",
+    "backend"
+  ],
   "scripts": {
-    "start": "node server/index.js",
+    "start": "npm run start --workspace backend",
     "dev": "node scripts/dev.js",
-    "dev:frontend": "vite --host 127.0.0.1",
-    "build": "vite build",
-    "create-admin": "node scripts/create-admin.js",
-    "test": "node --test"
+    "dev:frontend": "npm run dev --workspace frontend",
+    "dev:admin": "npm run dev --workspace Admin",
+    "dev:backend": "npm run dev --workspace backend",
+    "build": "npm run build --workspace frontend && npm run build --workspace Admin",
+    "build:frontend": "npm run build --workspace frontend",
+    "build:admin": "npm run build --workspace Admin",
+    "create-admin": "npm run create-admin --workspace backend",
+    "test": "npm test --workspace backend"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
   "engines": {
     "node": ">=20.6"
-  },
-  "dependencies": {
-    "ejs": "^7.0.2",
-    "dotenv": "^16.5.0",
-    "express": "^5.3.0",
-    "leaflet": "^1.9.4",
-    "mongoose": "^9.11.4",
-    "react": "^19.1.1",
-    "react-dom": "^19.1.1",
-    "react-leaflet": "^5.0.0",
-    "socket.io": "^4.8.4"
-  },
-  "devDependencies": {
-    "vite": "^6.3.5"
   }
 }

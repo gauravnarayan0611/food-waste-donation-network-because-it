@@ -465,16 +465,6 @@ a {
   grid-template-columns: 330px minmax(0, 1fr);
 }
 
-.admin-grid {
-  display: grid;
-  grid-template-columns: 0.8fr 1.2fr;
-  gap: 18px;
-}
-
-.admin-wide {
-  grid-column: 1 / -1;
-}
-
 .panel {
   padding: 20px;
 }
@@ -501,8 +491,7 @@ a {
   margin: 0;
 }
 
-.mini-stats,
-.analytics {
+.mini-stats {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
@@ -1229,7 +1218,6 @@ th {
   .section-grid,
   .dashboard-grid,
   .ngo-layout,
-  .admin-grid,
   .map-grid,
   .rider-shell {
     grid-template-columns: 1fr;
@@ -1280,7 +1268,6 @@ th {
 
   .workflow,
   .mini-stats,
-  .analytics,
   .form-row.two,
   .rider-stat-grid,
   .rider-task-details {

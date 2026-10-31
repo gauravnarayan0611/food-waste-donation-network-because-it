@@ -1,7 +1,10 @@
 const crypto = require("node:crypto");
+const fs = require("node:fs");
 const path = require("node:path");
 const { promisify } = require("node:util");
-require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
+const backendEnv = path.join(__dirname, ".env");
+const projectEnv = path.join(__dirname, "..", ".env");
+require("dotenv").config({ path: fs.existsSync(backendEnv) ? backendEnv : projectEnv });
 const express = require("express");
 const mongoose = require("mongoose");
 const { Server } = require("socket.io");
@@ -12,24 +15,29 @@ const scrypt = promisify(crypto.scrypt);
 const app = express();
 const httpServer = require("node:http").createServer(app);
 const localDevelopmentOrigins = [
+  "http://localhost:5174",
+  "http://127.0.0.1:5174",
+  "http://localhost:5175",
+  "http://127.0.0.1:5175",
   "http://localhost:5500",
   "http://127.0.0.1:5500"
 ];
+const allowedOrigins = [...new Set([
+  ...localDevelopmentOrigins,
+  ...String(process.env.FRONTEND_ORIGINS || "").split(",").map((origin) => origin.trim()).filter(Boolean)
+])];
 const io = new Server(httpServer, {
-  cors: { origin: localDevelopmentOrigins, credentials: true }
+  cors: { origin: allowedOrigins, credentials: true }
 });
 const cookieName = "foodbridge_session";
 const tokenLifetimeSeconds = 60 * 60 * 24 * 7;
-const projectRoot = path.join(__dirname, "..");
-const buildDirectory = path.join(projectRoot, "dist");
-
 app.use(express.json({ limit: "1mb" }));
 app.use((req, res, next) => {
   const origin = req.get("origin");
-  if (localDevelopmentOrigins.includes(origin)) {
+  if (allowedOrigins.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Access-Control-Allow-Credentials", "true");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
     res.vary("Origin");
     if (req.method === "OPTIONS") return res.sendStatus(204);
@@ -84,10 +92,11 @@ function verifyToken(token) {
 }
 
 function cookieOptions() {
+  const sameSite = process.env.FOODBRIDGE_COOKIE_SAME_SITE || "lax";
   return {
     httpOnly: true,
-    sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
+    sameSite,
+    secure: process.env.NODE_ENV === "production" || sameSite === "none",
     path: "/",
     maxAge: tokenLifetimeSeconds * 1000
   };
@@ -117,7 +126,8 @@ async function authenticate(req, res, next) {
 function requireRole(...roles) {
   return (req, res, next) => {
     if (!roles.includes(req.user.role)) {
-      return sendError(res, 403, "FORBIDDEN", "Your account cannot perform this action.");
+      const requiredRole = roles.length === 1 ? roles[0] : "an authorized account";
+      return sendError(res, 403, "FORBIDDEN", `${requiredRole} access is required. You are signed in as ${req.user.role}.`);
     }
     return next();
   };
@@ -125,6 +135,12 @@ function requireRole(...roles) {
 
 function validCoordinates(value) {
   if (value === undefined || value === null || value === "") return null;
+  if (typeof value !== "object" || Array.isArray(value)) return false;
+  const missing = (coordinate) => coordinate === undefined || coordinate === null || coordinate === "";
+  const latMissing = missing(value.lat);
+  const lngMissing = missing(value.lng);
+  if (latMissing && lngMissing) return null;
+  if (latMissing || lngMissing) return false;
   const lat = Number(value.lat);
   const lng = Number(value.lng);
   if (!Number.isFinite(lat) || lat < -90 || lat > 90 || !Number.isFinite(lng) || lng < -180 || lng > 180) {
@@ -142,7 +158,7 @@ function publicUser(user) {
     city: user.city,
     address: user.address,
     phone: user.phone,
-    coordinates: user.coordinates,
+    coordinates: validCoordinates(user.coordinates) || undefined,
     verified: user.verified,
     available: user.available
   };
@@ -181,9 +197,9 @@ function serializeDonation(donation, viewer) {
     donor,
     location: donation.location,
     address: donation.address,
-    coordinates: donation.coordinates,
+    coordinates: validCoordinates(donation.coordinates) || undefined,
     destinationAddress: donation.destinationAddress,
-    destinationCoordinates: donation.destinationCoordinates,
+    destinationCoordinates: validCoordinates(donation.destinationCoordinates) || undefined,
     pickupBefore: donation.pickupBefore,
     expiryTime: donation.expiryTime,
     image: donation.image,
@@ -373,7 +389,7 @@ app.get("/api/v1/ngos/verified", authenticate, async (req, res, next) => {
       id: String(ngo._id),
       name: ngo.name,
       city: ngo.city,
-      coordinates: ngo.coordinates
+      coordinates: validCoordinates(ngo.coordinates) || undefined
     })));
   } catch (error) {
     return next(error);
@@ -427,6 +443,13 @@ app.post("/api/v1/donations", authenticate, requireRole("Donor"), async (req, re
     });
     const populated = await populatedDonations(Donation.findById(donation._id));
     const result = serializeDonation(populated, req.user);
+    const admins = await User.find({ role: "Admin" }).select("_id");
+    await notifyUsers(
+      admins.map((admin) => admin._id),
+      `${result.foodName} was submitted and is waiting for approval.`,
+      "donation:submitted",
+      { donationId: result.id }
+    );
     return sendSuccess(res, result, 201);
   } catch (error) {
     return next(error);
@@ -644,7 +667,7 @@ app.patch("/api/v1/admin/donations/:id/approve", authenticate, requireRole("Admi
     );
     await notifyUsers(
       riders.map((rider) => rider._id),
-      `${donation.foodName} was approved. A delivery task will appear after an NGO claims it.`,
+      `${donation.foodName} was approved by Admin and is now visible to NGOs. You will be notified when an NGO claims it and the delivery task is ready.`,
       "donation:approved",
       { donationId }
     );
@@ -696,13 +719,6 @@ io.on("connection", (socket) => {
   socket.join(`user:${socket.data.user.sub}`);
 });
 
-app.use(express.static(buildDirectory));
-app.get(/^(?!\/api(?:\/|$)).*/, (req, res, next) => {
-  if (req.method !== "GET") return next();
-  return res.sendFile(path.join(buildDirectory, "index.html"), (error) => {
-    if (error) next(error);
-  });
-});
 app.use((req, res) => sendError(res, 404, "NOT_FOUND", "The requested endpoint was not found."));
 app.use((error, req, res, next) => {
   if (res.headersSent) return next(error);
@@ -738,4 +754,14 @@ if (require.main === module) {
   });
 }
 
-module.exports = { app, httpServer, io, start, signToken, verifyToken, donationApprovalStatus };
+module.exports = {
+  app,
+  httpServer,
+  io,
+  start,
+  signToken,
+  verifyToken,
+  donationApprovalStatus,
+  validCoordinates,
+  allowedOrigins
+};

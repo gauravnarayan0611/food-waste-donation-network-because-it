@@ -1,9 +1,12 @@
 const crypto = require("node:crypto");
+const fs = require("node:fs");
 const path = require("node:path");
 const { promisify } = require("node:util");
-require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
+const backendEnv = path.join(__dirname, "..", ".env");
+const projectEnv = path.join(__dirname, "..", "..", ".env");
+require("dotenv").config({ path: fs.existsSync(backendEnv) ? backendEnv : projectEnv });
 const mongoose = require("mongoose");
-const User = require("../server/models/User");
+const User = require("../models/User");
 
 const scrypt = promisify(crypto.scrypt);
 

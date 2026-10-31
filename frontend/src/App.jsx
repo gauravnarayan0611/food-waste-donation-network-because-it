@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CircleMarker, MapContainer, Popup, TileLayer, useMap } from "react-leaflet";
-import foodBridgeLogo from "../FoodBridge_ Order, Share, Enjoy.png";
+import foodBridgeLogo from "./assets/foodbridge-logo.png";
 
 const cities = {
   Amritsar: { lat: 31.634, lng: 74.8723 },
@@ -10,8 +10,10 @@ const cities = {
   Delhi: { lat: 28.6139, lng: 77.209 }
 };
 
-const navigation = ["home", "donor", "ngo", "admin", "rider", "map"];
-const riderSections = ["overview", "available", "active", "completed", "notifications"];
+const navigation = ["home", "donor", "ngo", "rider", "map"];
+const riderSections = ["overview", "available", "active", "history", "notifications"];
+const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
+const adminAppUrl = import.meta.env.VITE_ADMIN_URL || "http://127.0.0.1:5175";
 
 function localDateTime(hoursAhead) {
   const date = new Date(Date.now() + hoursAhead * 60 * 60 * 1000);
@@ -22,7 +24,7 @@ function localDateTime(hoursAhead) {
 async function apiRequest(path, options = {}) {
   let response;
   try {
-    response = await fetch(path, {
+    response = await fetch(`${apiBaseUrl}${path}`, {
       ...options,
       credentials: "include",
       headers: {
@@ -45,19 +47,30 @@ async function apiRequest(path, options = {}) {
   if (!response.ok || !payload.success) {
     const error = new Error(payload.error?.message || "The request could not be completed.");
     error.status = response.status;
+    error.code = payload.error?.code;
     throw error;
   }
   return payload.data;
 }
 
 function distanceKm(a, b) {
-  if (!a || !b) return null;
+  if (!isValidCoordinates(a) || !isValidCoordinates(b)) return null;
   const radians = (value) => value * Math.PI / 180;
   const dLat = radians(b.lat - a.lat);
   const dLng = radians(b.lng - a.lng);
   const calc = Math.sin(dLat / 2) ** 2
     + Math.cos(radians(a.lat)) * Math.cos(radians(b.lat)) * Math.sin(dLng / 2) ** 2;
   return 6371 * 2 * Math.atan2(Math.sqrt(calc), Math.sqrt(1 - calc));
+}
+
+function isValidCoordinates(value) {
+  return value !== null && typeof value === "object"
+    && Number.isFinite(value.lat) && value.lat >= -90 && value.lat <= 90
+    && Number.isFinite(value.lng) && value.lng >= -180 && value.lng <= 180;
+}
+
+function coordinatesOrCity(coordinates, city) {
+  return isValidCoordinates(coordinates) ? coordinates : cities[city];
 }
 
 function freshness(donation) {
@@ -102,12 +115,14 @@ function MapViewport({ points, fitRequest }) {
 
 function App() {
   const [user, setUser] = useState(null);
-  const [view, setView] = useState(location.hash.slice(1) || "home");
+  const [view, setView] = useState(() => {
+    const requestedView = location.hash.slice(1);
+    return navigation.includes(requestedView) ? requestedView : "home";
+  });
   const [riderSection, setRiderSection] = useState("overview");
   const [donations, setDonations] = useState([]);
   const [notifications, setNotifications] = useState([]);
   const [verifiedNgos, setVerifiedNgos] = useState([]);
-  const [adminNgos, setAdminNgos] = useState([]);
   const [metrics, setMetrics] = useState({});
   const [availableTasks, setAvailableTasks] = useState([]);
   const [riderTasks, setRiderTasks] = useState([]);
@@ -141,7 +156,6 @@ function App() {
       setNotifications([]);
       setAvailableTasks([]);
       setRiderTasks([]);
-      setAdminNgos([]);
       return;
     }
     const [nextDonations, nextNotifications, overview, nextVerifiedNgos] = await Promise.all([
@@ -154,7 +168,6 @@ function App() {
     setNotifications(nextNotifications);
     setMetrics(overview);
     setVerifiedNgos(nextVerifiedNgos);
-    if (activeUser.role === "Admin") setAdminNgos(await apiRequest("/api/v1/admin/ngos"));
     if (activeUser.role === "Rider") {
       const [available, mine] = await Promise.all([
         apiRequest("/api/v1/assignments/available"),
@@ -168,12 +181,35 @@ function App() {
     }
   }, []);
 
+  const syncSession = useCallback(async () => {
+    const { user: sessionUser } = await apiRequest("/api/v1/auth/session");
+    if (sessionUser?.role === "Admin") {
+      window.location.assign(adminAppUrl);
+      return sessionUser;
+    }
+    setUser(sessionUser);
+    if (sessionUser) {
+      const nextView = sessionUser.role.toLowerCase();
+      setView(nextView);
+      if (location.hash !== `#${nextView}`) history.replaceState(null, "", `#${nextView}`);
+    } else {
+      setView("home");
+      if (location.hash !== "#home") history.replaceState(null, "", "#home");
+    }
+    await refreshDashboardData(sessionUser);
+    return sessionUser;
+  }, [refreshDashboardData]);
+
   useEffect(() => {
     let active = true;
     (async () => {
       try {
         const { user: sessionUser } = await apiRequest("/api/v1/auth/session");
         if (!active) return;
+        if (sessionUser?.role === "Admin") {
+          window.location.replace(adminAppUrl);
+          return;
+        }
         setUser(sessionUser);
         await refreshDashboardData(sessionUser);
       } catch (error) {
@@ -184,6 +220,34 @@ function App() {
     })();
     return () => { active = false; };
   }, [refreshDashboardData, toast]);
+
+  useEffect(() => {
+    let syncing = false;
+    const handleFocus = async () => {
+      if (syncing || document.visibilityState !== "visible") return;
+      syncing = true;
+      try {
+        const { user: sessionUser } = await apiRequest("/api/v1/auth/session");
+        const sessionChanged = sessionUser?.id !== user?.id || sessionUser?.role !== user?.role;
+        if (sessionChanged) {
+          await syncSession();
+          toast(sessionUser
+            ? `This tab is now signed in as ${sessionUser.role}.`
+            : "Your FoodBridge session ended in another tab. Please sign in again.");
+        }
+      } catch (error) {
+        toast(`Could not verify your session: ${error.message}`);
+      } finally {
+        syncing = false;
+      }
+    };
+    window.addEventListener("focus", handleFocus);
+    document.addEventListener("visibilitychange", handleFocus);
+    return () => {
+      window.removeEventListener("focus", handleFocus);
+      document.removeEventListener("visibilitychange", handleFocus);
+    };
+  }, [user, syncSession, toast]);
 
   useEffect(() => {
     const handleHash = () => {
@@ -205,14 +269,14 @@ function App() {
       if (typeof window.io !== "function") {
         await new Promise((resolve, reject) => {
           const script = document.createElement("script");
-          script.src = "/socket.io/socket.io.js";
+          script.src = `${apiBaseUrl}/socket.io/socket.io.js`;
           script.onload = resolve;
           script.onerror = () => reject(new Error("Could not load live updates from the FoodBridge server."));
           document.head.appendChild(script);
         });
       }
       if (cancelled) return;
-      const socket = window.io({ withCredentials: true });
+      const socket = window.io(apiBaseUrl || window.location.origin, { withCredentials: true });
       socketRef.current = socket;
       socket.on("notification", (item) => {
         setNotifications((items) => [{ ...item, id: `live-${Date.now()}` }, ...items]);
@@ -277,6 +341,10 @@ function App() {
       const { user: loggedIn } = await apiRequest(`/api/v1/auth/${registering ? "register" : "login"}`, {
         method: "POST", body: JSON.stringify(body)
       });
+      if (loggedIn.role === "Admin") {
+        window.location.assign(adminAppUrl);
+        return;
+      }
       setUser(loggedIn);
       await refreshDashboardData(loggedIn);
       setAuthOpen(false);
@@ -323,6 +391,20 @@ function App() {
       if (refreshUser) await refreshDashboardData(refreshUser);
       toast(successMessage);
     } catch (error) {
+      if (error.status === 403 && error.code === "FORBIDDEN" && refreshUser) {
+        try {
+          const sessionUser = await syncSession();
+          if (sessionUser?.id !== refreshUser.id || sessionUser?.role !== refreshUser.role) {
+            toast(sessionUser
+              ? `Your session changed to ${sessionUser.role} in another tab. Sign in as an NGO to accept donations.`
+              : "Your session ended in another tab. Please sign in again.");
+            return;
+          }
+        } catch (syncError) {
+          toast(`Could not verify your session after the request failed: ${syncError.message}`);
+          return;
+        }
+      }
       toast(error.message);
     }
   }
@@ -407,19 +489,6 @@ function App() {
     null
   );
 
-  const approveNgo = (id) => runAction(
-    () => apiRequest(`/api/v1/admin/ngos/${id}/approve`, { method: "PATCH" }),
-    "NGO approved."
-  );
-  const approveDonation = (id) => runAction(
-    () => apiRequest(`/api/v1/admin/donations/${id}/approve`, { method: "PATCH" }),
-    "Donation approved. Riders have been notified."
-  );
-  const removeDonation = (id) => runAction(
-    () => apiRequest(`/api/v1/admin/donations/${id}`, { method: "DELETE" }),
-    "Listing removed."
-  );
-
   const visibleDonorDonations = useMemo(() => donations
     .filter((item) => item.status !== "Removed")
     .filter((item) => donorFilter === "All"
@@ -437,13 +506,13 @@ function App() {
     const donation = [...available].sort((a, b) => new Date(a.expiryTime) - new Date(b.expiryTime))[0];
     const nearest = verifiedNgos.map((ngo) => ({
       ngo,
-      distance: distanceKm(donation.coordinates || cities[donation.location], ngo.coordinates || cities[ngo.city])
+      distance: distanceKm(coordinatesOrCity(donation.coordinates, donation.location), coordinatesOrCity(ngo.coordinates, ngo.city))
     })).filter((item) => item.distance !== null).sort((a, b) => a.distance - b.distance)[0];
     return nearest ? { ...nearest, donation } : null;
   }, [donations, verifiedNgos]);
 
-  const completedTasks = riderTasks.filter((task) => task.deliveryStatus === "COMPLETED")
-    .filter((task) => !historySearch || [
+  const completedTasks = riderTasks.filter((task) => task.deliveryStatus === "COMPLETED");
+  const historyTasks = riderTasks.filter((task) => !historySearch || [
       task.foodName, task.donor?.name, task.ngo?.name, task.quantity
     ].some((value) => String(value || "").toLowerCase().includes(historySearch.toLowerCase())));
   const activeTasks = riderTasks.filter((task) => ["ACCEPTED", "PICKED_UP", "DELIVERED"].includes(task.deliveryStatus));
@@ -453,26 +522,23 @@ function App() {
     ...donations.filter((item) => item.status === "Available").map((item) => ({
       type: "donation", title: item.foodName, subtitle: `${item.quantity} portions · ${item.location}`,
       donation: item,
-      ...(item.coordinates || cities[item.location])
+      ...(coordinatesOrCity(item.coordinates, item.location) || {})
     })),
     ...(user?.role === "Rider" ? availableTasks.map((task) => ({
       type: "donation",
       title: task.foodName,
       subtitle: `${task.quantity} portions · ${task.location}`,
       donation: task,
-      ...(task.coordinates || cities[task.location])
+      ...(coordinatesOrCity(task.coordinates, task.location) || {})
     })) : []),
     ...verifiedNgos.map((ngo) => ({
       type: "ngo", title: ngo.name, subtitle: ngo.city,
       ngo,
-      ...(ngo.coordinates || cities[ngo.city])
+      ...(coordinatesOrCity(ngo.coordinates, ngo.city) || {})
     }))
   ].filter((point) => Number.isFinite(point.lat) && Number.isFinite(point.lng)), [donations, verifiedNgos, availableTasks, user]);
 
   const todayStats = metrics || {};
-  const adminDonations = donations.filter((item) => item.status !== "Removed");
-  const pendingDonations = adminDonations.filter((item) => item.approvalStatus === "PENDING");
-  const pendingNgos = adminNgos.filter((ngo) => !ngo.verified);
 
   return (
     <>
@@ -491,6 +557,7 @@ function App() {
               onClick={(event) => { event.preventDefault(); navigate(item); }}>
               {item === "ngo" ? "NGO" : item[0].toUpperCase() + item.slice(1)}
             </a>)}
+            <a href={adminAppUrl}>Admin</a>
           </div>
           <div className="nav-actions">
             <span className="user-chip">{user ? `${user.name} | ${user.role}` : "Guest"}</span>
@@ -623,43 +690,6 @@ function App() {
           </div>
         </section>
 
-        <section className={`view${view === "admin" ? " active" : ""}`}>
-          <div className="page-shell">
-            <PageHeading eyebrow="Admin console" title="Verify NGOs, manage listings, review impact"
-              action={user?.role !== "Admin" && <button className="button primary" onClick={() => openAuth("Admin")}>Admin Login</button>} />
-            {user?.role === "Admin" ? <div className="admin-grid">
-              <section className="panel"><div className="panel-heading"><h3>Analytics</h3></div>
-                <div className="analytics">
-                  <Stat label="Registered users" value={todayStats.users || 0} />
-                  <Stat label="Available donations" value={todayStats.availableDonations || 0} />
-                  <Stat label="Meals delivered" value={todayStats.mealsDelivered || 0} />
-                  <Stat label="Verified NGOs" value={todayStats.verifiedNgos || 0} />
-                </div>
-              </section>
-              <section className="panel"><div className="panel-heading"><h3>NGO Approvals</h3></div>
-                <div className="table-wrap"><table><thead><tr><th>Organization</th><th>City</th><th>Status</th><th>Action</th></tr></thead>
-                  <tbody>{adminNgos.map((ngo) => <tr key={ngo.id}><td>{ngo.name}</td><td>{ngo.city || "—"}</td>
-                    <td><span className={`pill ${ngo.verified ? "completed" : "reserved"}`}>{ngo.verified ? "Verified" : "Pending"}</span></td>
-                    <td>{!ngo.verified && <button className="button primary" onClick={() => approveNgo(ngo.id)}>Approve</button>}</td>
-                  </tr>)}</tbody>
-                </table>{!adminNgos.length && <EmptyState>No NGO accounts yet.</EmptyState>}</div>
-              </section>
-              <section className="panel admin-wide"><div className="panel-heading"><h3>Donation Approval Requests</h3></div>
-                <div className="donation-list compact-list">{pendingDonations.length
-                  ? pendingDonations.map((item) =>
-                    <DonationCard key={item.id} donation={item} mode="admin" onApprove={approveDonation} onRemove={removeDonation} />)
-                  : <EmptyState>No donor requests are waiting for approval.</EmptyState>}</div>
-              </section>
-              <section className="panel admin-wide"><div className="panel-heading"><h3>Donation Listings</h3></div>
-                <div className="donation-list compact-list">{adminDonations.length > pendingDonations.length
-                  ? adminDonations.filter((item) => item.approvalStatus !== "PENDING")
-                    .map((item) => <DonationCard key={item.id} donation={item} mode="admin" onRemove={removeDonation} />)
-                  : <EmptyState>No listings found.</EmptyState>}</div>
-              </section>
-            </div> : <section className="panel"><EmptyState>Sign in as an administrator to manage FoodBridge.</EmptyState></section>}
-          </div>
-        </section>
-
         <section className={`view${view === "rider" ? " active" : ""}`}>
           {user?.role === "Rider" ? <div className="page-shell rider-shell">
             <aside className="rider-sidebar panel">
@@ -670,7 +700,12 @@ function App() {
               <nav className="rider-menu" aria-label="Rider dashboard navigation">
                 {riderSections.map((section) => <button key={section} type="button"
                   className={riderSection === section ? "active" : ""}
-                  onClick={() => setRiderSection(section)}>{section === "active" ? "My Deliveries" : section[0].toUpperCase() + section.slice(1)}</button>)}
+                  onClick={() => setRiderSection(section)}>
+                  {section === "active" ? "My Deliveries"
+                    : section === "history" ? `Delivery History (${riderTasks.length})`
+                      : section === "notifications" ? `Notifications (${notifications.length})`
+                        : section[0].toUpperCase() + section.slice(1)}
+                </button>)}
                 <button type="button" onClick={logout}>Log out</button>
               </nav>
             </aside>
@@ -688,6 +723,9 @@ function App() {
                   <button className="button secondary" onClick={() => setRiderSection("available")}>View all</button></div>
                   <TaskList tasks={availableTasks.slice(0, 3)} mode="available" available={user.available}
                     onAction={(id) => riderAction(id, "accept", "Delivery assigned to you.")} empty="There are no available delivery tasks." /></section>
+                <section className="panel rider-task-panel"><div className="panel-heading"><div><p className="eyebrow">Recent updates</p><h3>Notifications</h3></div>
+                  <button className="button secondary" onClick={() => setRiderSection("notifications")}>View all</button></div>
+                  <NotificationList notifications={notifications.slice(0, 3)} /></section>
               </>}
               {riderSection === "available" && <><PageHeading eyebrow="New opportunities" title="Available tasks" />
                 <TaskList tasks={availableTasks} mode="available" available={user.available}
@@ -695,9 +733,9 @@ function App() {
               {riderSection === "active" && <><PageHeading eyebrow="Your route" title="My active deliveries" />
                 <TaskList tasks={activeTasks} mode="active" onAction={(id, action) => riderAction(id, action,
                   action === "pickup" ? "Pickup confirmed. Donor and NGO have been notified." : "Marked as delivered. The NGO must confirm receipt.")} empty="You have no active deliveries." /></>}
-              {riderSection === "completed" && <><PageHeading eyebrow="Delivery history" title="Completed deliveries" />
+              {riderSection === "history" && <><PageHeading eyebrow="Delivery history" title="All my deliveries" />
                 <label className="rider-search">Search deliveries<input type="search" value={historySearch} onChange={(e) => setHistorySearch(e.target.value)} placeholder="Search food, donor, or NGO" /></label>
-                <TaskList tasks={completedTasks} mode="completed" empty="Completed deliveries will appear here." /></>}
+                <TaskList tasks={historyTasks} mode="history" empty="Deliveries you accept will appear here." /></>}
               {riderSection === "notifications" && <><PageHeading eyebrow="Updates" title="Notifications" />
                 <div className="notifications"><NotificationList notifications={notifications} /></div></>}
             </div>
@@ -820,17 +858,17 @@ function NotificationList({ notifications }) {
     : <EmptyState>No new notifications.</EmptyState>;
 }
 
-function DonationCard({ donation, mode, user, onClaim, onComplete, onReceipt, onApprove, onRemove }) {
+function DonationCard({ donation, mode, user, onClaim, onComplete, onReceipt }) {
   const freshnessInfo = freshness(donation);
   const claimingNgo = mode === "ngo" && user?.id === donation.claimedBy;
   const showQr = claimingNgo && donation.status === "Reserved" && !donation.riderId;
   const awaitingReceipt = claimingNgo && donation.deliveryStatus === "DELIVERED";
   const inDelivery = claimingNgo && donation.deliveryStatus
     && !["DELIVERED", "COMPLETED"].includes(donation.deliveryStatus);
-  const destination = donation.ngo?.coordinates || cities[donation.ngo?.city];
-  const distance = distanceKm(donation.coordinates || cities[donation.location], destination);
-  return <article className={`donation-card${mode === "admin" ? " compact" : ""}`}>
-    {mode !== "admin" && <div className="donation-image" style={{ backgroundImage: donation.image ? `url("${donation.image}")` : undefined }} />}
+  const destination = coordinatesOrCity(donation.ngo?.coordinates, donation.ngo?.city);
+  const distance = distanceKm(coordinatesOrCity(donation.coordinates, donation.location), destination);
+  return <article className="donation-card">
+    <div className="donation-image" style={{ backgroundImage: donation.image ? `url("${donation.image}")` : undefined }} />
     <div><div className="donation-topline"><h4>{donation.foodName}</h4><span className={`pill ${donation.approvalStatus === "PENDING" ? "reserved" : statusClass(donation.status)}`}>
       {donation.approvalStatus === "PENDING" ? "Pending Admin Approval" : donation.status}</span></div>
       <p>{donation.quantity} portions from {donation.donor?.name || "Unknown donor"} at {donation.address}.</p>
@@ -847,10 +885,6 @@ function DonationCard({ donation, mode, user, onClaim, onComplete, onReceipt, on
         {showQr && <button className="button secondary" onClick={() => onComplete(donation)}>Verify Pickup</button>}
         {awaitingReceipt && <button className="button primary" onClick={() => onReceipt(donation.id)}>Confirm Receipt</button>}
         {inDelivery && <span className="pill reserved">Rider status: {donation.deliveryStatus.replaceAll("_", " ")}</span>}
-        {mode === "admin" && donation.approvalStatus === "PENDING"
-          && <button className="button primary" onClick={() => onApprove(donation.id)}>Approve Donation</button>}
-        {mode === "admin" && !["Removed", "Completed"].includes(donation.status)
-          && <button className="button danger" onClick={() => onRemove(donation.id)}>Remove Listing</button>}
       </div>
     </div>
   </article>;
@@ -859,13 +893,15 @@ function DonationCard({ donation, mode, user, onClaim, onComplete, onReceipt, on
 function TaskList({ tasks, mode, available, onAction, empty }) {
   if (!tasks.length) return <div className="rider-task-list"><EmptyState>{empty}</EmptyState></div>;
   return <div className="rider-task-list">{tasks.map((task) => {
-    const distance = distanceKm(task.coordinates || cities[task.location], task.destinationCoordinates || cities[task.ngo?.city]);
+    const pickupCoordinates = coordinatesOrCity(task.coordinates, task.location);
+    const destinationCoordinates = coordinatesOrCity(task.destinationCoordinates, task.ngo?.city);
+    const distance = distanceKm(pickupCoordinates, destinationCoordinates);
     let action = null;
     if (mode === "available") action = <button className="button primary" disabled={!available}
       onClick={() => onAction(task.id)}>Accept Delivery</button>;
-    else if (task.deliveryStatus === "ACCEPTED") action = <button className="button primary" onClick={() => onAction(task.id, "pickup")}>Confirm Pickup</button>;
-    else if (task.deliveryStatus === "PICKED_UP") action = <button className="button secondary" onClick={() => onAction(task.id, "deliver")}>Mark as Delivered</button>;
-    else if (task.deliveryStatus === "DELIVERED") action = <span className="pill reserved">Waiting for NGO receipt confirmation</span>;
+    else if (mode === "active" && task.deliveryStatus === "ACCEPTED") action = <button className="button primary" onClick={() => onAction(task.id, "pickup")}>Confirm Pickup</button>;
+    else if (mode === "active" && task.deliveryStatus === "PICKED_UP") action = <button className="button secondary" onClick={() => onAction(task.id, "deliver")}>Mark as Delivered</button>;
+    else if (mode === "active" && task.deliveryStatus === "DELIVERED") action = <span className="pill reserved">Waiting for NGO receipt confirmation</span>;
     return <article className="rider-task-card" key={task.id}>
       <div className="rider-task-heading"><div><p className="eyebrow">{task.category}</p><h3>{task.foodName}</h3></div>
         <span className={`pill ${statusClass(task.deliveryStatus || "AVAILABLE")}`}>{(task.deliveryStatus || "AVAILABLE").replaceAll("_", " ")}</span>
@@ -876,10 +912,11 @@ function TaskList({ tasks, mode, available, onAction, empty }) {
         <div><strong>Pickup location</strong>{task.address} · {task.location}</div>
         <div><strong>NGO delivery location</strong>{task.destinationAddress || task.ngo?.address || task.ngo?.city || "Destination unavailable"}
           {task.ngo?.phone && <><br /><a href={`tel:${task.ngo.phone}`}>{task.ngo.phone}</a></>}</div>
-        <div><strong>Distance</strong>{distance === null ? "Not available" : `${distance.toFixed(1)} km${task.coordinates && task.destinationCoordinates ? "" : " (approx.)"}`}</div>
+        <div><strong>Distance</strong>{distance === null ? "Not available" : `${distance.toFixed(1)} km${isValidCoordinates(task.coordinates) && isValidCoordinates(task.destinationCoordinates) ? "" : " (approx.)"}`}</div>
         <div><strong>Pickup deadline</strong>{task.pickupBefore} · {new Date(task.expiryTime).toLocaleString()}</div>
         <div><strong>Special handling</strong>{task.instructions || "No special instructions"}</div>
-        {mode === "completed" && <div><strong>Delivery date</strong>{task.completedAt ? new Date(task.completedAt).toLocaleString() : "—"}</div>}
+        {(mode === "completed" || mode === "history") && <div><strong>{mode === "completed" ? "Delivery date" : "Last activity"}</strong>
+          {new Date(task.completedAt || task.deliveredAt || task.pickedUpAt || task.acceptedAt || task.createdAt).toLocaleString()}</div>}
       </div>
       {action && <div className="card-actions">{action}</div>}
     </article>;

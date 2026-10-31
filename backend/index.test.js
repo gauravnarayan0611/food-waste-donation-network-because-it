@@ -2,7 +2,14 @@ const assert = require("node:assert/strict");
 const { test } = require("node:test");
 const mongoose = require("mongoose");
 const Donation = require("./models/Donation");
-const { httpServer, signToken, verifyToken, donationApprovalStatus } = require("./index");
+const {
+  httpServer,
+  signToken,
+  verifyToken,
+  donationApprovalStatus,
+  validCoordinates,
+  allowedOrigins
+} = require("./index");
 
 test("session tokens validate signatures and expiration claims", () => {
   const originalSecret = process.env.FOODBRIDGE_JWT_SECRET;
@@ -49,6 +56,20 @@ test("donation approval reuses existing status fields without changing the model
   assert.equal(donationApprovalStatus({ status: "Reserved", claimedBy: new mongoose.Types.ObjectId(), rider: null }), "APPROVED");
 });
 
+test("optional coordinate objects are normalized without rejecting missing NGO coordinates", () => {
+  assert.equal(validCoordinates(undefined), null);
+  assert.equal(validCoordinates({}), null);
+  assert.equal(validCoordinates({ lat: undefined, lng: undefined }), null);
+  assert.deepEqual(validCoordinates({ lat: 30.7333, lng: 76.7794 }), { lat: 30.7333, lng: 76.7794 });
+  assert.equal(validCoordinates({ lat: 30.7333 }), false);
+  assert.equal(validCoordinates({ lat: 91, lng: 76.7794 }), false);
+});
+
+test("local Admin and public frontend origins are allowed to use credentialed API and Socket.IO", () => {
+  assert.ok(allowedOrigins.includes("http://127.0.0.1:5174"));
+  assert.ok(allowedOrigins.includes("http://127.0.0.1:5175"));
+});
+
 test("local Live Server origins receive credentialed API CORS headers", async () => {
   const server = httpServer;
   const originalSecret = process.env.FOODBRIDGE_JWT_SECRET;
@@ -73,12 +94,20 @@ test("local Live Server origins receive credentialed API CORS headers", async ()
       method: "OPTIONS",
       headers: {
         Origin: origin,
-        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Method": "DELETE",
         "Access-Control-Request-Headers": "content-type"
       }
     });
     assert.equal(preflight.status, 204);
     assert.equal(preflight.headers.get("access-control-allow-origin"), origin);
+    assert.match(preflight.headers.get("access-control-allow-methods"), /DELETE/);
+
+    const adminOriginResponse = await fetch(`${baseUrl}/api/v1/auth/session`, {
+      headers: { Origin: "http://127.0.0.1:5175" }
+    });
+    assert.equal(adminOriginResponse.status, 200);
+    assert.equal(adminOriginResponse.headers.get("access-control-allow-origin"), "http://127.0.0.1:5175");
+    assert.equal(adminOriginResponse.headers.get("access-control-allow-credentials"), "true");
 
     const socketClient = await fetch(`${baseUrl}/socket.io/socket.io.js`, {
       headers: { Origin: origin }
